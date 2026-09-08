@@ -1,5 +1,5 @@
 """
-Memory and latency benchmarks for the rate limiter algorithms.
+Memory, latency and accuracy benchmarks for the rate limiter algorithms.
 
 Requires a local Redis. Uses db 14 so it never touches dev (db 0) or
 test (db 15) data.
@@ -12,7 +12,7 @@ import time
 
 import redis
 
-from scratch import allow, allow_sliding_log
+from scratch import allow, allow_sliding_counter, allow_sliding_log
 
 r = redis.Redis(host="localhost", port=6379, db=14, decode_responses=True)
 
@@ -42,21 +42,26 @@ def bench_memory(label, key, fn, user, limit, window, clock):
 
     mem = r.memory_usage(key)
     if mem is None:
-        print(f"{label:<46}{'key not found: ' + key:>31}")
+        print(f"{label:<48}{'key not found: ' + key:>31}")
         return
 
     entries = entry_count(key)
-    print(f"{label:<46}{mem:>11,} B{entries:>9,}{mem / entries:>11.0f}")
+    print(f"{label:<48}{mem:>11,} B{entries:>9,}{mem / entries:>11.0f}")
 
 
 print(f"\nMEMORY  ({N:,} requests per scenario)")
-print(f"{'scenario':<46}{'key size':>13}{'entries':>9}{'B/entry':>11}")
-print("-" * 79)
+print(f"{'scenario':<48}{'key size':>13}{'entries':>9}{'B/entry':>11}")
+print("-" * 81)
 
 bench_memory(
-    "fixed window, 10k reqs (any volume)",
+    "fixed window, any volume",
     f"rl:heavy_fixed:{BASE // 3600}",
     allow, "heavy_fixed", 100_000, 3600, lambda i: BASE,
+)
+bench_memory(
+    "sliding counter, any volume",
+    "rl:swc:heavy_swc",
+    allow_sliding_counter, "heavy_swc", 100_000, 3600, lambda i: BASE + i,
 )
 bench_memory(
     "log, 10k reqs spread over a 3600s window",
@@ -95,21 +100,22 @@ def bench_latency(label, fn, user, limit, window):
     p50 = samples[len(samples) // 2]
     p95 = samples[int(len(samples) * 0.95)]
     p99 = samples[int(len(samples) * 0.99)]
-    print(f"{label:<32}{mean:>9.0f}{p50:>8.0f}{p95:>8.0f}{p99:>8.0f}{1e6 / mean:>12,.0f}")
+    print(f"{label:<34}{mean:>9.0f}{p50:>8.0f}{p95:>8.0f}{p99:>8.0f}{1e6 / mean:>12,.0f}")
 
 
 print(f"\n\nLATENCY  ({TIMING_N:,} calls, single client, localhost)")
-print(f"{'algorithm':<32}{'mean µs':>9}{'p50':>8}{'p95':>8}{'p99':>8}{'calls/sec':>12}")
-print("-" * 77)
+print(f"{'algorithm':<34}{'mean µs':>9}{'p50':>8}{'p95':>8}{'p99':>8}{'calls/sec':>12}")
+print("-" * 79)
 
 bench_latency("fixed window", allow, "t_fixed", 100_000, 60)
+bench_latency("sliding counter", allow_sliding_counter, "t_swc", 100_000, 60)
 bench_latency("sliding log (under limit)", allow_sliding_log, "t_log", 100_000, 60)
 bench_latency("sliding log (at limit, capped)", allow_sliding_log, "t_capped", 100, 60)
 
 
 # ------------------------------------------------------- latency vs size ----
 
-print("\n\nSLIDING LOG LATENCY vs ENTRIES IN WINDOW")
+print("\n\nLATENCY vs ENTRIES IN WINDOW  (sliding log only)")
 print(f"{'entries':<14}{'mean µs':>10}{'p99 µs':>10}")
 print("-" * 34)
 
@@ -127,6 +133,63 @@ for size in (10, 100, 1_000, 10_000):
     samples.sort()
     p99 = samples[int(len(samples) * 0.99)]
     print(f"{size:<14,}{statistics.mean(samples):>10.0f}{p99:>10.0f}")
+
+
+# -------------------------------------------------------------- accuracy ----
+# The counter approximates the log. This measures the gap directly: replay one
+# traffic pattern through all three and compare how many each admits.
+
+LIMIT, WINDOW = 10, 60
+BOUNDARY = (BASE // WINDOW) * WINDOW + WINDOW - 1        # last second of a window
+
+print("\n\nBOUNDARY BURST  (full quota at the last second, then again after)")
+print(f"{'offset into next window':<26}{'fixed':>8}{'counter':>9}{'log':>7}{'elapsed':>10}")
+print("-" * 60)
+
+for offset in (2, 10, 20, 30, 45, 59):
+    totals = {}
+    for name, fn, user in (
+        ("fixed", allow, "a_fixed"),
+        ("counter", allow_sliding_counter, "a_swc"),
+        ("log", allow_sliding_log, "a_log"),
+    ):
+        r.flushdb()
+        first = sum(fn(r, user, LIMIT, WINDOW, now=BOUNDARY)[0] for _ in range(LIMIT))
+        second = sum(fn(r, user, LIMIT, WINDOW, now=BOUNDARY + offset)[0]
+                     for _ in range(LIMIT))
+        totals[name] = first + second
+
+    elapsed = ((BOUNDARY + offset) % WINDOW) / WINDOW
+    print(f"{'+' + str(offset) + 's':<26}"
+          f"{totals['fixed']:>8}{totals['counter']:>9}{totals['log']:>7}{elapsed:>10.2f}")
+
+print("\nfixed jumps straight to 2x. the counter releases quota in proportion to")
+print("elapsed, converging on fixed only once the previous window has aged out —")
+print("which is correct, and is what the log does too.")
+
+
+# ------------------------------------------------------ steady-state error --
+# Over a long run at a steady rate, how far does the counter drift from exact?
+
+print("\n\nSTEADY-STATE ACCURACY  (5,000 requests at 1 req / 200ms, limit 10/60s)")
+print(f"{'algorithm':<20}{'admitted':>10}{'vs log':>10}")
+print("-" * 40)
+
+admitted = {}
+for name, fn, user in (
+    ("fixed window", allow, "s_fixed"),
+    ("sliding counter", allow_sliding_counter, "s_swc"),
+    ("sliding log", allow_sliding_log, "s_log"),
+):
+    r.flushdb()
+    admitted[name] = sum(
+        fn(r, user, LIMIT, WINDOW, now=BASE + i * 0.2)[0] for i in range(5_000)
+    )
+
+exact = admitted["sliding log"]
+for name, count in admitted.items():
+    drift = f"{(count - exact) / exact * 100:+.1f}%" if exact else "n/a"
+    print(f"{name:<20}{count:>10,}{drift:>10}")
 
 r.flushdb()
 print()
