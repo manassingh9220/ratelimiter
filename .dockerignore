@@ -1,0 +1,13 @@
+.git/
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+
+# dev-only, not needed to run the API
+tests/
+Notes.md
+bench_marking.py
+smoke.py
