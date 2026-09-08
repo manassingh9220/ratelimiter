@@ -218,3 +218,99 @@ end
 
 return {allowed, remaining}
 """
+
+
+# ---------------------------------------------------------------------------
+# TOKEN BUCKET
+# ---------------------------------------------------------------------------
+# Stores two numbers per user — tokens remaining, and when the bucket was
+# last topped up — and computes the refill lazily on each call instead of on
+# a timer. There is no window at all, fixed or sliding: capacity refills
+# continuously at `rate` tokens per second, capped at `capacity`.
+#
+# The defining behaviour, and the reason to reach for this over the other
+# three: it deliberately PERMITS bursts. A client idle for a while
+# accumulates tokens up to `capacity` and can spend them all at once — the
+# right shape for APIs where occasional spikes are normal and only the
+# sustained rate needs capping.
+#
+# A new key starts FULL (tokens = capacity), not empty. Starting empty would
+# throttle the very first request from a client that has never used the
+# limiter before — none of the other three algorithms punish a cold key like
+# that, so this one should not either.
+#
+# Two decisions worth knowing:
+#
+#   1. A hash, not a string. Tokens and last_refill must be read and written
+#      together — a hash keeps that atomic without a second key, the same
+#      reasoning that put the sliding counter's two integers in a hash.
+#
+#   2. Tokens are written with %.17g, not Lua's default tostring. Every call
+#      round-trips the value through a string: read, add a fractional
+#      refill, write back. Lua's default number-to-string uses %.14g (14
+#      significant digits), which is not enough to reconstruct an IEEE-754
+#      double exactly — 17 digits are required for that. Left on the
+#      default, every call quietly drops the last bit or two of precision,
+#      and that rounding compounds into visible drift over enough requests.
+#      %.17g makes the round trip exact, so no drift accumulates no matter
+#      how many requests pass through.
+#
+# Elapsed time is clamped at zero before it multiplies into a refill amount.
+# Every other script here only subtracts a fixed cutoff (ZREMRANGEBYSCORE) or
+# keys off a floored bucket number, both harmless if `now` moves backward.
+# This script multiplies elapsed time directly into a token count, so a
+# negative elapsed from clock skew would erase tokens instead of adding
+# them — the clamp is load-bearing here in a way it isn't elsewhere.
+#
+# KEYS[1] = rl:tb:{user}
+# ARGV[1] = now in MILLISECONDS
+# ARGV[2] = capacity (max tokens / max burst size)
+# ARGV[3] = refill rate in tokens per SECOND
+# returns   {allowed, remaining}   (remaining is floor(tokens), post-request)
+# ---------------------------------------------------------------------------
+LUA_TOKEN_BUCKET = """
+local key      = KEYS[1]
+local now      = tonumber(ARGV[1])
+local capacity = tonumber(ARGV[2])
+local rate     = tonumber(ARGV[3])          -- tokens per second
+
+local data = redis.call('HMGET', key, 'tokens', 'last_refill')
+
+local tokens, last_refill
+if data[1] then
+    tokens      = tonumber(data[1])
+    last_refill = tonumber(data[2])
+else
+    -- Cold key: start full, as of now, so the first-ever request is not
+    -- throttled by a limiter it has never touched.
+    tokens      = capacity
+    last_refill = now
+end
+
+local elapsed = now - last_refill
+if elapsed < 0 then
+    elapsed = 0
+end
+
+tokens = tokens + elapsed * (rate / 1000)
+if tokens > capacity then
+    tokens = capacity
+end
+
+local allowed = 0
+if tokens >= 1 then
+    allowed = 1
+    tokens  = tokens - 1
+end
+
+-- %.17g: enough significant digits to round-trip a double exactly, so the
+-- fractional remainder survives the string form Redis stores it in.
+redis.call('HSET', key, 'tokens', string.format('%.17g', tokens), 'last_refill', now)
+
+-- TTL is however long a full refill from empty takes, so a bucket that goes
+-- idle disappears once its state stops being meaningful — the same
+-- self-cleanup the other three get from EXPIRE/PEXPIRE.
+redis.call('EXPIRE', key, math.ceil(capacity / rate))
+
+return {allowed, math.floor(tokens)}
+"""
