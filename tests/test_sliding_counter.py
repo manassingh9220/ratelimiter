@@ -12,7 +12,7 @@ It is an approximation, so several assertions here allow a small tolerance.
 Where they do, the reason is stated.
 """
 
-from scratch import allow, allow_sliding_counter, allow_sliding_log
+from rate_limiter import allow, allow_sliding_counter, allow_sliding_log
 
 LIMIT = 10
 WINDOW = 60

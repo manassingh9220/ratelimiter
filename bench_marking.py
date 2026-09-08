@@ -12,7 +12,7 @@ import time
 
 import redis
 
-from scratch import allow, allow_sliding_counter, allow_sliding_log
+from rate_limiter import allow, allow_sliding_counter, allow_sliding_log
 
 r = redis.Redis(host="localhost", port=6379, db=14, decode_responses=True)
 

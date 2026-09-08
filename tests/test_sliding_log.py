@@ -1,8 +1,8 @@
-
-from scratch import allow, allow_sliding_log
+from rate_limiter import allow, allow_sliding_log
 
 LIMIT = 10
 WINDOW = 60
+
 
 def test_allows_upto_limit_then_denies(rdb):
     now = 1_700_000_000
@@ -10,7 +10,8 @@ def test_allows_upto_limit_then_denies(rdb):
 
     allowed = [ok for ok, _ in results]
     assert allowed[:LIMIT] == [True] * LIMIT
-    assert allowed[LIMIT:] == [False,False]
+    assert allowed[LIMIT:] == [False, False]
+
 
 def test_denied_request_are_not_recorded(rdb):
     """Design choice: a rejected request must not consume a slot in the window."""
@@ -21,6 +22,7 @@ def test_denied_request_are_not_recorded(rdb):
     assert rdb.zcard("rl:log:alice") == LIMIT, (
         "only accepted requests should be stored in the sorted set"
     )
+
 
 def test_same_millisecond_requests_all_counted(rdb):
     """
@@ -35,11 +37,13 @@ def test_same_millisecond_requests_all_counted(rdb):
         "requests sharing a timestamp were collapsed — member is not unique"
     )
 
+
 def test_ttl_is_set_and_refreshed(rdb):
     now = 1_700_000_000
     allow_sliding_log(rdb, "alice", LIMIT, WINDOW, now=now)
     ttl = rdb.pttl("rl:log:alice")
     assert 0 < ttl <= WINDOW * 1000
+
 
 def test_separate_users_have_separate_windows(rdb):
     now = 1_700_000_000
@@ -48,6 +52,7 @@ def test_separate_users_have_separate_windows(rdb):
 
     assert allow_sliding_log(rdb, "alice", LIMIT, WINDOW, now=now)[0] is False
     assert allow_sliding_log(rdb, "bob", LIMIT, WINDOW, now=now)[0] is True
+
 
 def test_recovers_after_full_window(rdb):
     """Old entries must be pruned once they fall outside the window."""
@@ -61,6 +66,7 @@ def test_recovers_after_full_window(rdb):
     assert ok is True
     assert remaining == LIMIT - 1
     assert rdb.zcard("rl:log:alice") == 1, "stale entries were not pruned"
+
 
 def test_partial_recovery_mid_window(rdb):
     """Half the window elapsing should free exactly the requests that aged out."""
@@ -105,6 +111,7 @@ def test_sliding_log_prevents_boundary_burst(rdb):
         f"{total} requests allowed within 2 seconds against a limit of "
         f"{LIMIT} per {WINDOW}s — sliding window should cap at {LIMIT}"
     )
+
 
 def test_fixed_and_sliding_disagree_at_the_boundary(rdb):
     """

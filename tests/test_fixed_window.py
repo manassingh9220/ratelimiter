@@ -1,4 +1,4 @@
-from scratch import allow
+from rate_limiter import allow
 
 LIMIT = 10
 WINDOW = 60
